@@ -1,0 +1,728 @@
+#!/usr/bin/env python
+
+import os, sys, socket, re, logging, subprocess, time, glob, calendar, shutil, signal, stat, math, select
+from optparse import OptionParser
+
+logger = logging.getLogger('main')
+
+pjoin = os.path.join
+
+def hsize(s):
+    if s <= 0:
+        return str(s)
+
+    x = int(math.log(s)/math.log(1000.))
+    mm = ' kMGTPEZY'
+    if 0 < x < len(mm):
+        return str(s/1000**x)+mm[x]
+    else:
+        return str(s)
+    
+def freespace(p):
+    s = os.statvfs(p)
+    return s.f_bsize * s.f_bavail
+
+def escape_shell_arg(s):
+    if re.search(r'[^a-zA-Z0-9._/=-]', s):
+        return "'" + s.replace("'", "'\\''") + "'"
+    else:
+        return s
+    
+def call( *args, **kwargs):
+    pretend = kwargs.pop('pretend')
+    if pretend: 
+        print '# (in directory %s)' % os.getcwd()
+        print '# %s' % ' '.join([escape_shell_arg(x) for x in args[0] ])
+        print '#'
+    else:
+        return subprocess.call(*args, **kwargs)
+        
+def remove(arg, pretend=False):
+    if pretend:
+        print '# rm %s' % escape_shell_arg(arg)
+    else:
+        os.remove(arg)
+        
+def copy(a, b, pretend=False):
+    if pretend:
+        print '# cp %s %s' % (escape_shell_arg(a), escape_shell_arg(b))
+    else:
+        shutil.copy(a,b)
+
+def move(a, b, pretend=False):
+    if pretend:
+        print '# mv %s %s' % (escape_shell_arg(a), escape_shell_arg(b))
+    else:
+        os.rename(a,b)
+
+def filesize(path):
+    return os.stat(path)[stat.ST_SIZE]
+
+def dirsize(p, exclude=[]):
+    pexclude = [ pjoin(p, ex) for ex in exclude ]
+    s = 0
+    for (dirpath, dirnames, filenames) in os.walk(p):
+        assert dirpath.startswith(p)
+        if dirpath[len(p)+1:] in exclude:
+            continue
+
+        for fn in filenames:
+            fpath = pjoin(dirpath, fn)
+            if os.path.isfile(fpath):
+                s += filesize(fpath)
+
+    return s
+
+def fatal_tar_error(line):
+    for x in [ 'file changed as we read it' ]:
+        if line.rstrip().endswith(x):
+            return False
+    return True
+
+def fatal_tar_errors(errlist):
+    return [ line for line in errlist if fatal_tar_error(line) ]
+
+increments = {
+    'once': 60*60*24*365*100,
+    'annually': 60*60*24*365,
+    'monthly': 60*60*24*30,
+    'weekly': 60*60*24*7,
+    'daily': 60*60*24,
+    'hourly': 60*60,
+}
+
+date_format = {
+    'once': '%Y-%m-%d',
+    'annually': '%Y-%m-%d',
+    'monthly': '%Y-%m-%d',
+    'weekly': '%Y-%m-%d',
+    'daily': '%Y-%m-%d',
+    'hourly': '%Y-%m-%d-%H',
+}
+
+date_format_glob = {
+    'once': '????-??-??',
+    'annually': '????-??-??',
+    'monthly': '????-??-??',
+    'weekly': '????-??-??',
+    'daily': '????-??-??',
+    'hourly': '????-??-??-??',
+}
+
+def fixme():
+    sys.exit('not implemented')
+    
+def clean(s):
+    return re.sub(r'[^A-Za-z0-9_]', '_', s)
+
+def datestr(t, increment='weekly'):
+    if t is None:
+        return date_format_glob[increment]
+    else:
+        return time.strftime(date_format[increment], time.gmtime(t))
+
+def strdate(s, increment='weekly'):
+    return calendar.timegm(time.strptime(s, date_format[increment]))
+
+def datelen(increment='weekly'):
+    return len(date_format_glob[increment])
+
+def ensuredirs(dst):
+    d,x = os.path.split(dst)
+    dirs = []
+    while d and not os.path.exists(d):
+        dirs.append(d)
+        d,x = os.path.split(d)
+        
+    dirs.reverse()
+    
+    for d in dirs:
+        if not os.path.exists(d):
+            os.mkdir(d)
+
+def ensuredir(dst):
+    ensuredirs(dst)
+    if not os.path.exists(dst):
+        os.mkdir(dst)
+
+class SoleError(Exception):
+    pass
+
+class Sole(object):
+    
+    def __init__(self, pid_path):
+        self._pid_path = pid_path
+        
+        pid = None
+        self._other_running = False
+        if os.path.exists(self._pid_path):
+            try:
+                f = open(self._pid_path, 'r')
+                pid = int(f.read().strip())
+                f.close()
+            except:
+                self._other_running = True
+                raise SoleError('Cannot read lockfile (path = %s)' % self._pid_path)
+            
+            try:
+                os.kill(pid, 0)
+                self._other_running = True
+            except OSError, e:
+                if e.errno == errno.EPERM:
+                    self._other_running = True   # ? running under different user id
+                
+        if self._other_running:
+            raise SoleError('Other instance is running (pid = %i, path=%s)' % (pid, self._pid_path))
+            
+        if not self._other_running:
+            try:
+                ensuredirs(self._pid_path)
+                f = open(self._pid_path, 'w')
+                f.write(str(os.getpid()))
+                f.close()
+            except:
+                raise SoleError('Cannot write lockfile (path = %s)' % self._pid_path)
+            
+    def __del__(self):
+        if not self._other_running:
+            import os
+            os.unlink(self._pid_path)
+
+class Loc:
+
+    def __init__(self, host, path):
+        self._host = host
+        self._path = path.rstrip('/')
+
+    def host(self):
+        return self._host
+
+    def path(self):
+        if not self._path.startswith('/'):
+            return pjoin(os.environ['HOME'], self._path)
+
+        return self._path
+
+    def ident(self):
+        p = self._path
+        return '-'.join( [ self.host() ] + [ clean(x) for x in self.path().split('/') ] )
+
+    def is_local(self):
+        return socket.gethostname() == self.host()
+    
+    def exists(self):
+        if self.is_local():
+            return os.path.exists(self.path())
+        else:
+            fixme()
+
+    def splitlast(self):
+        toks = self.path().rsplit('/',1)
+        if toks[0] == '':
+            toks[0] = '/'
+        return toks
+
+    def isdir(self):
+        if self.is_local():
+            return os.path.isdir(self.path())
+        else:
+            fixme()
+
+    def ensuredir(self):
+        ensuredir(self.path())
+
+    def glob_content(self, filepattern):
+        if self.is_local():
+            pat = pjoin(self.path(), filepattern)
+            return glob.glob(pat)
+
+        else:
+            fixme()
+        
+    def dirsize(self, exclude=[]):
+        if self.is_local():
+            return dirsize(self.path(), exclude)
+        else:
+            fixme()
+
+    def freespace(self):
+        if self.is_local():
+            return freespace(self.path())
+        else:
+            fixme()
+
+    def __str__(self):
+        return '%s:%s' % (self.host(), self.path())
+
+class Terminated(Exception):
+    pass
+
+class TarFailed(Exception):
+    def __init__(self, retcode, stderr):
+        Exception.__init__(self)
+        self._retcode = retcode
+        self._stderr = stderr
+
+    def retcode(self):
+        return self._retcode
+
+    def stderr(self):
+        return self._stderr
+
+class Stuff:
+    def __init__(self, original, backup, full_schedule, incr_schedule, full_keep, exclude, pretend=False):
+        self._original = original
+        self._backup = backup
+        self._full_schedule = full_schedule
+        self._incr_schedule = incr_schedule
+        self._full_keep = full_keep
+        self._pretend = pretend
+        self._tempfiles_to_delete = []
+        self._lock = None
+        self._exclude = exclude
+
+    def cleanup(self):
+        while self._tempfiles_to_delete:
+            fn = self._tempfiles_to_delete.pop()
+            try:
+                if os.path.isfile(fn):
+                    self.remove(fn)
+            except:
+                logger.warn('Cannot remove file "%s".' % fn)
+
+    def excludes(self):
+        return self._exclude
+
+    def date_fmt_key(self):
+        if self._incr_schedule:
+            return self._incr_schedule
+        else:
+            return self._full_schedule
+
+    def volatile(self, fn):
+        self._tempfiles_to_delete.append(fn)
+
+    def set_pretend(self, pretend):
+        self._pretend = pretend
+        
+    def original(self):
+        return self._original
+
+    def backup(self):
+        return self._backup
+
+    def tar_full_fn(self, tfull=None):
+        return '%s-%s.tar' % (self.original().ident(), datestr(tfull, increment=self.date_fmt_key()))
+    
+    def tar_full_path(self, tfull):
+        return pjoin(self.backup().path(), self.tar_full_fn(tfull))
+
+    def tar_incr_fn(self, tfull=None, tincr=None):
+        return '%s-%s-%s.tar' % (self.original().ident(), datestr(tfull, increment=self.date_fmt_key()), datestr(tincr, increment=self.date_fmt_key()))
+        
+    def tar_incr_path(self, tfull, tincr):
+        return pjoin(self.backup().path(), self.tar_incr_fn(tfull, tincr))
+
+    def meta_path(self, tfull):
+        fn =  '%s-%s.tar.meta' % (self.original().ident(), datestr(tfull, increment=self.date_fmt_key()))
+        return pjoin(self.backup().path(), fn)        
+
+    def lock_path(self):
+        fn = '%s.lock' % self.original().ident()
+        return pjoin(self.backup().path(), fn)
+
+    def lock(self):
+        self._lock = Sole(self.lock_path())
+
+    def unlock(self):
+        del self._lock
+        self._lock = None
+
+    def do_full(self, tfull):
+        if self.backup().is_local() and self.original().is_local():
+            oparent, oobj = self.original().splitlast()
+            os.chdir(oparent)
+            if os.path.exists(self.meta_path(tfull)):
+                self.remove(self.meta_path(tfull))
+            
+            tar_fn = self.tar_full_path(tfull)
+            meta_fn = self.meta_path(tfull)
+
+            self.volatile(tar_fn + '.temp')
+            self.volatile(meta_fn + '.temp')
+
+            retcode, stderr = self.call(['tar', '--create', '--ignore-failed-read', 
+                '--file=%s' % (tar_fn + '.temp'), 
+                '--listed-incremental=%s' % (meta_fn + '.temp')] +
+                [ '--exclude=%s' % ex for ex in self._exclude ] +
+                [oobj])
+
+            if retcode != 0 and fatal_tar_errors(stderr.splitlines()):
+                raise TarFailed(retcode=retcode, stderr=stderr)
+
+            self.move(tar_fn + '.temp', tar_fn)
+            self.move(meta_fn + '.temp', meta_fn)
+
+        else:
+            fixme()
+
+    def do_incr(self, tfull, tincr):
+        if self.backup().is_local() and self.original().is_local():
+            oparent, oobj = self.original().splitlast()
+            os.chdir(oparent)
+
+            tar_fn = self.tar_incr_path(tfull, tincr)
+            meta_fn = self.meta_path(tfull)
+
+            self.volatile(tar_fn + '.temp')
+            self.volatile(meta_fn + '.temp')
+            
+            self.copy(meta_fn, meta_fn + '.temp') 
+
+            retcode, stderr = self.call(['tar', '--create', '--ignore-failed-read', 
+                '--file=%s' % (tar_fn + '.temp'), 
+                '--listed-incremental=%s' % (meta_fn + '.temp')] +
+                [ '--exclude=%s' % ex for ex in self._exclude ] +
+                [oobj])
+
+            if retcode != 0 and fatal_tar_errors(stderr.splitlines()):
+                raise TarFailed(retcode=retcode, stderr=stderr)
+
+            self.move(tar_fn + '.temp', tar_fn)
+            self.move(meta_fn + '.temp', meta_fn)
+
+        else:
+            fixme()
+
+    def incr_size(self, tfull, tincr):
+        tar_fn = self.tar_incr_path(tfull, tincr)
+        return filesize(tar_fn)
+
+    def full_size(self, tfull):
+        tar_fn = self.tar_full_path(tfull)
+        return filesize(tar_fn)
+
+    def total_size(self):
+        s = 0
+        for tfull in self.full_backups():
+            s += self.full_size(tfull)
+        
+        for tfull, tincr in self.incr_backups():
+            s += self.incr_size(tfull, tincr)
+
+        return s
+
+    def full_backups(self):
+        t = []
+        k = self.date_fmt_key()
+        for p in self.backup().glob_content(self.tar_full_fn()):
+            t.append(strdate(p[-4-datelen(k):-4], increment=k))
+        t.sort()
+        return t
+
+    def incr_backups(self, tfull=None):
+        tt = []
+        k = self.date_fmt_key()
+        for p in self.backup().glob_content(self.tar_incr_fn(tfull=tfull)):
+            tfull = strdate(p[-4-datelen(k)-1-datelen(k):-4-datelen(k)-1], increment=k)
+            tincr = strdate(p[-4-datelen(k):-4], increment=k)
+            tt.append((tfull, tincr))
+        tt.sort((lambda a,b: cmp(a[1],b[1])))
+        return tt
+
+    def last_full(self):
+        t = self.full_backups()
+        if not t:
+            return None
+        else:
+            return t[-1]
+
+    def last_incr(self, tfull=None):
+        tt = self.incr_backups(tfull)
+        if not tt:
+            return None
+        else:
+            return tt[-1]
+
+    def pending(self, now=None):
+        
+        tfull = self.last_full()
+        if now is None:
+            now = time.time()
+
+        if self._full_schedule and (tfull is None or tfull + increments[self._full_schedule] <= now):
+            return 'full'
+        else:
+            tincr = self.last_incr(tfull)
+            if (self._incr_schedule and (tincr is None or tincr[1] + increments[self._incr_schedule] <= now) and
+                                 tfull + increments[self._incr_schedule] <= now):
+                return 'incr'
+
+        return None
+
+    def do_backup(self, now=None):
+        self.lock()
+        try:
+            if now is None:
+                now = time.time()
+            p = self.pending(now)
+            if p == 'full':
+                self.do_full(now)
+            elif p == 'incr':
+                tfull = self.last_full()
+                self.do_incr(tfull, now)
+
+        finally:
+            self.unlock()
+
+    def do_cleanup(self):
+        self.lock()
+        try:
+            tfulls = self.full_backups()
+            for tfull in tfulls[:-self._full_keep]:
+                tincrs = self.incr_backups(tfull)
+                for tfullx, tincr in self.incr_backups(tfull):
+                    self.remove(self.tar_incr_path(tfullx, tincr))
+                
+                self.remove(self.tar_full_path(tfull))
+                self.remove(self.meta_path(tfull))
+
+        finally:
+            self.unlock()
+
+    def remove(self, arg):
+        remove(arg, pretend=self._pretend)
+    
+    def move(self, *args):
+        kwargs = dict(pretend=self._pretend)
+        move(*args, **kwargs)
+
+    def copy(self, *args):
+        kwargs = dict(pretend=self._pretend)
+        copy(*args, **kwargs)
+    
+    def call(self, *args, **kwargs):
+        pretend = kwargs.pop('pretend', False)
+        if pretend:
+            print '# (in directory %s)' % os.getcwd()
+            print '# %s' % ' '.join([escape_shell_arg(x) for x in args[0] ])
+            print '#'
+            return 0, ''
+
+        sigflag = [ 0 ]
+        def handler(signum, frame):
+            sigflag[0] = signum
+
+        signal.signal(signal.SIGINT, handler)
+        signal.signal(signal.SIGTERM, handler)
+        try:
+            try:
+                kwargs['stderr'] = subprocess.PIPE
+                p = subprocess.Popen( *args, **kwargs )
+                stderr = p.communicate()[1]
+                retcode = p.returncode
+
+            except select.error, e:
+                if e.args[0] == 4:    # interruped system call
+                    stderr = p.communicate()[1]
+                    retcode = p.returncode
+                else:
+                    raise e
+        finally:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    
+        if sigflag[0]:
+            raise Terminated('Terminated by signal %i' % sigflag[0])
+    
+        return retcode, stderr
+
+    def avail_pattern(self):
+        f = self.full_backups()
+        i = self.incr_backups()
+        ff = [ (x,0) for x in f ]
+        a = sorted(i+ff)
+        return ''.join( [ 'Fi'[x[1]!=0] for x in a ] )
+
+    def abbreviated_schedules(self):
+        abbr = ''
+        if self._full_schedule:
+            abbr += self._full_schedule[0]
+        if self._incr_schedule:
+            abbr += self._incr_schedule[0]
+
+        return abbr
+
+    def __str__(self):
+        return '%s -> %s' % (self._original, self._backup)
+
+
+def parseloc(s):
+    host, path = s.split(':')
+    return Loc(host, path)
+
+def parseschedule(s):
+    full_schedule = None
+    incr_schedule = None
+    for x in s.split(','):
+        when, kind = x.split()
+        if kind == 'full':
+            full_schedule = when
+        if kind == 'incremental':
+            incr_schedule = when
+
+    return full_schedule, incr_schedule    
+
+class InvalidDefinition(Exception):
+    pass
+
+class StuffConfig:
+    def stuff(self):
+        if not hasattr(self, 'original'):
+            sys.exit('error in backup config file')
+
+        for k in ['original', 'location', 'schedule', 'keep']:
+            if not hasattr(self, k):
+                sys.exit('error in backup config file (missing key: %s), in section for valuable %s' % (k, self.original))
+        try:
+            original = parseloc(self.original)
+            backup = parseloc(self.location)
+            full_schedule, incr_schedule = parseschedule(self.schedule)
+            full_keep = int(self.keep)
+            exclude = []
+            if hasattr(self, 'exclude'):
+                exclude = self.exclude
+
+        except Exception, e:
+            sys.exit('error in backup config file: %s' % e)
+
+        return Stuff(original, backup, full_schedule, incr_schedule, full_keep, exclude)
+
+data = StuffConfig()
+
+def parseconfig(fn):
+    f = open(fn, 'r')
+    stuffs = []
+
+    iline = 0
+    sc = None    
+    for line in f:
+        iline += 1
+        sline = line.strip()
+        if sline.startswith('#') or sline == '':
+            continue
+
+        if sline.startswith('===') and sline.endswith('==='):
+            if sc:
+                stuffs.append(sc.stuff())
+
+            sc = StuffConfig()
+            sc.original = sline.strip('=').strip()
+            
+            continue
+
+        if sc:
+            toks = sline.split(':', 1)
+            if len(toks) != 2:
+                sys.exit('error in backup config file (expected "key: value"), line %i: "%s"' % (iline, sline))
+
+            k = toks[0].strip()
+            v = toks[1].strip()
+            
+            if k not in ['location', 'schedule', 'keep', 'exclude']:
+                sys.exit('error in backup config file (invalid key: %s), line %i: "%s"' % (iline, sline, k))
+            
+            if k in ['exclude']: 
+                if k not in sc.__dict__:
+                    sc.__dict__[k] = []
+                sc.__dict__[k].append(v)
+            else:
+                if k in sc.__dict__:
+                    sys.exit('error in backup config file (key given more than once: %s), line %i: "%s"' % (iline, sline, k))
+
+                sc.__dict__[k] = v
+            
+    f.close()
+    if sc:
+        stuffs.append(sc.stuff())
+
+    return stuffs
+
+
+parser = OptionParser()
+parser.add_option('-v', '--verbose', 
+    action='store_true', dest='verbose', default=False,
+    help='be verbose')
+parser.add_option('-p', '--pretend', 
+    action='store_true', dest='pretend', default=False,
+    help='tell what would be done')
+parser.add_option('-l', '--list', 
+    action='store_true', dest='list', default=False,
+    help='list valuables')
+parser.add_option('-s', '--calculate-sizes', 
+    action='store_true', dest='calculate_sizes', default=False,
+    help='calculate sizes of valuables')
+
+(options, args) = parser.parse_args()
+
+loglevel = logging.WARNING
+if options.verbose:
+    loglevel = logging.DEBUG
+
+programname = 'backup'
+
+logging.basicConfig(
+    level=loglevel,
+    format = programname+':%(name)-4s - %(levelname)-8s - %(message)s' )
+
+
+config_fn = pjoin(os.environ['HOME'], '.backup')
+
+intargs = []
+for arg in args:
+    try:
+        intargs.append(int(arg))
+    except:
+        pass
+
+d = 24*60*60
+stuffs = parseconfig(config_fn)
+try:
+    for istuff, stuff in enumerate(stuffs):
+        opath = stuff.original().path() 
+
+        if len(args) != 0 and opath not in args and istuff+1 not in intargs:
+            continue
+
+        stuff.set_pretend(options.pretend)
+        
+        try:
+            if options.list:
+                if stuff.original().is_local():
+                    spend = {None: '', 'full': '*F*', 'incr': '*i*'}[stuff.pending()]
+                    sorigsize = '-'
+                    if options.calculate_sizes:
+                        sorigsize = hsize(stuff.original().dirsize(exclude=stuff.excludes()))
+                    print '%4s %-2s %-50s %5s %5s %5s %3s [%s]' % (
+                            '(%i)' % (istuff+1), stuff.abbreviated_schedules(), opath, sorigsize, hsize(stuff.total_size()), 
+                            hsize(stuff.backup().freespace()), spend, stuff.avail_pattern())
+                else:
+                    print '%4s %-2s (%s:%s)' % ('(%i)' % (istuff+1), stuff.abbreviated_schedules(), stuff.original().host(), opath )
+            else:
+                if stuff.original().is_local():
+                    try:
+                        stuff.do_backup()
+                        stuff.do_cleanup()
+                    except SoleError, e:
+                        logger.error('Backup of "%s" is locked by another instance of this program.' % opath)
+                    except TarFailed, e:
+                        logger.error('Creating backup archive for "%s" failed. (Tar had an exit status of %i)' % (opath, e.retcode()))
+                        for line in e.stderr().splitlines():
+                            logger.error('... %s' % line)
+        finally:
+            stuff.cleanup()
+
+except Terminated, e:
+    logger.warn('Terminated.')
+
+
