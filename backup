@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import os, sys, socket, re, logging, subprocess, time, glob, calendar, shutil, signal, stat, math, select
+import os, sys, socket, re, logging, subprocess, time, glob, calendar, shutil, signal, stat, math, select, errno
 from optparse import OptionParser
 
 logger = logging.getLogger('main')
