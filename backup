@@ -502,8 +502,7 @@ class Stuff:
         copy(*args, **kwargs)
     
     def call(self, *args, **kwargs):
-        pretend = kwargs.pop('pretend', False)
-        if pretend:
+        if self._pretend: 
             print '# (in directory %s)' % os.getcwd()
             print '# %s' % ' '.join([escape_shell_arg(x) for x in args[0] ])
             print '#'
